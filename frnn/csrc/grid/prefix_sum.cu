@@ -161,9 +161,7 @@ inline int floorPow2(int n) {
 
 #define BLOCK_SIZE 256
 
-int **g_scanBlockSumsInt = 0;
-unsigned int g_numEltsAllocated = 0;
-unsigned int g_numLevelsAllocated = 0;
+
 
 bool cudaCheck(cudaError_t status, const std::string &msg) {
   if (status != cudaSuccess) {
@@ -175,54 +173,44 @@ bool cudaCheck(cudaError_t status, const std::string &msg) {
   return true;
 }
 
-void preallocBlockSumsInt(unsigned int maxNumElements) {
-  assert(g_numEltsAllocated == 0); // shouldn't be called
+std::tuple<int**, unsigned int, unsigned int> preallocBlockSumsInt(unsigned int maxNumElements) {
+    unsigned int blockSize = BLOCK_SIZE; 
+    unsigned int numElts = maxNumElements;
+    int level = 0;
 
-  g_numEltsAllocated = maxNumElements;
-  unsigned int blockSize = BLOCK_SIZE; // max size of the thread blocks
-  unsigned int numElts = maxNumElements;
-  int level = 0;
+    do {
+        unsigned int numBlocks = std::max(1u, (unsigned int)ceil((float)numElts / (2.f * blockSize)));
+        if (numBlocks > 1) level++;
+        numElts = numBlocks;
+    } while (numElts > 1);
 
-  do {
-    unsigned int numBlocks =
-        max(1, (int)ceil((float)numElts / (2.f * blockSize)));
-    if (numBlocks > 1)
-      level++;
-    numElts = numBlocks;
-  } while (numElts > 1);
+    int** scanBlockSumsInt = (int**)malloc(level * sizeof(int*));
+    unsigned int numLevelsAllocated = level;
 
-  g_scanBlockSumsInt = (int **)malloc(level * sizeof(int *));
-  g_numLevelsAllocated = level;
+    numElts = maxNumElements;
+    level = 0;
 
-  numElts = maxNumElements;
-  level = 0;
-
-  do {
-    unsigned int numBlocks =
-        max(1, (int)ceil((float)numElts / (2.f * blockSize)));
-    if (numBlocks > 1)
-      cudaCheck(cudaMalloc((void **)&g_scanBlockSumsInt[level++],
-                           numBlocks * sizeof(int)),
-                "Malloc prescanBlockSumsInt g_scanBlockSumsInt");
-    numElts = numBlocks;
-  } while (numElts > 1);
+    do {
+        unsigned int numBlocks = std::max(1u, (unsigned int)ceil((float)numElts / (2.f * blockSize)));
+        if (numBlocks > 1)
+            cudaMalloc((void**)&scanBlockSumsInt[level++], numBlocks * sizeof(int));
+        numElts = numBlocks;
+    } while (numElts > 1);
+    return {scanBlockSumsInt, maxNumElements, numLevelsAllocated};
 }
 
-void deallocBlockSumsInt() {
-  if (g_scanBlockSumsInt != 0x0) {
-    for (unsigned int i = 0; i < g_numLevelsAllocated; i++)
-      cudaCheck(cudaFree(g_scanBlockSumsInt[i]),
-                "Malloc deallocBlockSumsInt g_scanBlockSumsInt");
-    free((void **)g_scanBlockSumsInt);
-  }
 
-  g_scanBlockSumsInt = 0;
-  g_numEltsAllocated = 0;
-  g_numLevelsAllocated = 0;
+void deallocBlockSumsInt(int** scanBlockSumsInt, unsigned int numLevelsAllocated) {
+    if (scanBlockSumsInt != nullptr) {
+        for (unsigned int i = 0; i < numLevelsAllocated; i++)
+            cudaFree(scanBlockSumsInt[i]);
+        free(scanBlockSumsInt);
+    }
 }
 
-void prescanArrayRecursiveInt(int *outArray, const int *inArray,
-                              int numElements, int level) {
+void prescanArrayRecursiveInt(int *outArray, const int *inArray, 
+                              int numElements, int** scanBlockSumsInt, 
+                              unsigned int numLevelsAllocated, int level = 0) {
   unsigned int blockSize = BLOCK_SIZE; // max size of the thread blocks
   unsigned int numBlocks =
       max(1, (int)ceil((float)numElements / (2.f * blockSize)));
@@ -270,10 +258,10 @@ void prescanArrayRecursiveInt(int *outArray, const int *inArray,
   // execute the scan
   if (numBlocks > 1) {
     prescanInt<true, false><<<grid, threads, sharedMemSize>>>(
-        outArray, inArray, g_scanBlockSumsInt[level], numThreads * 2, 0, 0);
+        outArray, inArray, scanBlockSumsInt[level], numThreads * 2, 0, 0);
     if (np2LastBlock) {
       prescanInt<true, true><<<1, numThreadsLastBlock, sharedMemLastBlock>>>(
-          outArray, inArray, g_scanBlockSumsInt[level], numEltsLastBlock,
+          outArray, inArray, scanBlockSumsInt[level], numEltsLastBlock,
           numBlocks - 1, numElements - numEltsLastBlock);
     }
 
@@ -282,14 +270,15 @@ void prescanArrayRecursiveInt(int *outArray, const int *inArray,
     // This will give us a new value that must be added to each block to
     // get the final results.
     // recursive (CPU) call
-    prescanArrayRecursiveInt(g_scanBlockSumsInt[level],
-                             g_scanBlockSumsInt[level], numBlocks, level + 1);
+    prescanArrayRecursiveInt(scanBlockSumsInt[level],
+                            scanBlockSumsInt[level], numBlocks, scanBlockSumsInt, numLevelsAllocated, level + 1);
 
-    uniformAddInt<<<grid, threads>>>(outArray, g_scanBlockSumsInt[level],
+
+    uniformAddInt<<<grid, threads>>>(outArray, scanBlockSumsInt[level],
                                      numElements - numEltsLastBlock, 0, 0);
     if (np2LastBlock) {
       uniformAddInt<<<1, numThreadsLastBlock>>>(
-          outArray, g_scanBlockSumsInt[level], numEltsLastBlock, numBlocks - 1,
+          outArray, scanBlockSumsInt[level], numEltsLastBlock, numBlocks - 1,
           numElements - numEltsLastBlock);
     }
   } else if (isPowerOfTwo(numElements)) {
@@ -314,11 +303,11 @@ at::Tensor PrefixSumCUDA(const at::Tensor grid_cnt, const at::Tensor params) {
     int num_grids = params_a[n][GRID_3D_TOTAL];
     // std::cout << num_grids << std::endl;
 
-    preallocBlockSumsInt(num_grids);
-    prescanArrayRecursiveInt(grid_off.contiguous().data_ptr<int>() + n * G,
-                             grid_cnt.contiguous().data_ptr<int>() + n * G,
-                             num_grids, 0);
-    deallocBlockSumsInt();
+auto [scanBlockSumsInt, numEltsAllocated, numLevelsAllocated] = preallocBlockSumsInt(num_grids);
+        prescanArrayRecursiveInt(grid_off.contiguous().data_ptr<int>() + n * G,
+                                 grid_cnt.contiguous().data_ptr<int>() + n * G,
+                                 num_grids, scanBlockSumsInt, numLevelsAllocated, 0);
+        deallocBlockSumsInt(scanBlockSumsInt, numLevelsAllocated);
   }
   return grid_off;
 }
